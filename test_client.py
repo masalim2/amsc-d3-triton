@@ -46,6 +46,7 @@ class TestSnbamsc2dCnnU:
         data = np.random.rand(1149, 128, 1).astype(np.float32)
         result = client.infer(self.MODEL, {"zero_padding2d_input": data})
         assert isinstance(result, dict)
+        assert len(list(result.values())) > 0
         for arr in result.values():
             assert isinstance(arr, np.ndarray)
 
@@ -58,6 +59,7 @@ class TestSnbamsc2dCnnV:
         data = np.random.rand(1148, 128, 1).astype(np.float32)
         result = client.infer(self.MODEL, {"zero_padding2d_input": data})
         assert isinstance(result, dict)
+        assert len(list(result.values())) > 0
         for arr in result.values():
             assert isinstance(arr, np.ndarray)
 
@@ -70,6 +72,7 @@ class TestSnbamsc2dCnnZ:
         data = np.random.rand(480, 128, 1).astype(np.float32)
         result = client.infer(self.MODEL, {"zero_padding2d_1_input": data})
         assert isinstance(result, dict)
+        assert len(list(result.values())) > 0
         for arr in result.values():
             assert isinstance(arr, np.ndarray)
 
@@ -79,9 +82,10 @@ class TestDoubleMetricLearning:
 
     def test_infer(self, client: TritonHEPClient) -> None:
         _require_model(client, self.MODEL)
-        features = np.random.rand(44).astype(np.float32)
+        features = np.random.rand(1, 44).astype(np.float32)
         result = client.infer(self.MODEL, {"FEATURES": features})
         assert isinstance(result, dict)
+        assert len(list(result.values())) > 0
         for arr in result.values():
             assert isinstance(arr, np.ndarray)
 
@@ -95,6 +99,7 @@ class TestHiggsInteractionNet:
         sv = np.random.rand(14, 5).astype(np.float32)
         result = client.infer(self.MODEL, {"input_cpf": cpf, "input_sv": sv})
         assert isinstance(result, dict)
+        assert len(list(result.values())) > 0
         for arr in result.values():
             assert isinstance(arr, np.ndarray)
 
@@ -113,6 +118,7 @@ class TestParticleNet:
             "sv_mask__5": np.random.rand(1, 10).astype(np.float32),
         })
         assert isinstance(result, dict)
+        assert len(list(result.values())) > 0
         for arr in result.values():
             assert isinstance(arr, np.ndarray)
 
@@ -155,6 +161,7 @@ class TestNuGraph2:
         })
         assert isinstance(result, dict)
         assert len(result) > 0
+        assert len(list(result.values())) > 0
         for arr in result.values():
             assert isinstance(arr, np.ndarray)
 
@@ -172,6 +179,7 @@ class TestBTagging:
                 shape = [1, *shape]
             inputs[name] = np.random.rand(*shape).astype(spec["np_dtype"])
         result = client.infer(self.MODEL, inputs)
+        assert len(list(result.values())) > 0
         assert isinstance(result, dict)
         assert len(result) > 0
 
@@ -188,10 +196,11 @@ class TestInferFiles:
         _require_model(client, self.MODEL)
         inp = tmp_path / "input.npz"
         out = tmp_path / "output.npz"
-        np.savez(inp, FEATURES=np.random.rand(44).astype(np.float32))
+        np.savez(inp, FEATURES=np.random.rand(1, 44).astype(np.float32))
         client.infer_files(self.MODEL, inp, out)
         with np.load(out) as data:
             assert len(data.files) > 0
+            assert len(list(data.values())) > 0
             for arr in data.values():
                 assert isinstance(arr, np.ndarray)
 
