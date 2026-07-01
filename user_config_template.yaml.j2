@@ -45,8 +45,8 @@ engine:
 
       # These unused variables are parsed by the inference service
       # (qstat_inference_function) to map the running PBS job to a model:
-      model_name="amsc-d3"
-      framework="triton"
+      model_name="amsc-d3-triton"
+      framework="amsc-d3-triton"
       cluster="sophia"
 
       source /eagle/inference_service/amsc-d3-triton/.venv/bin/activate

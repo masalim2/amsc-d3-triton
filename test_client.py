@@ -15,7 +15,7 @@ import os
 import numpy as np
 import pytest
 
-from client import TritonHEPClient
+from triton_hep_client import TritonHEPClient
 
 HOSTNAME = os.environ.get("TRITON_HOSTNAME", "localhost")
 
