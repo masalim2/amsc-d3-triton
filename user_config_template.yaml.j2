@@ -29,7 +29,12 @@ engine:
       module load apptainer
       set -euox pipefail
 
-      TRITON_IMAGE=/eagle/AmSC_Demos/amsc-d3/apptainer/tritonserver_light.sif
+      TRITON_IMAGE=/eagle/inference_service/misha/amsc-d3-triton/models/tritonserver_light.sif
+      ROOT_REPO="/eagle/inference_service/misha/amsc-d3-triton/models/triton-models"
+      CUDA_REPO="${ROOT_REPO}/cuda_models"
+      WORK_DIR="/eagle/inference_service/amsc-d3-triton-workdir"
+      LOG_DIR="${WORK_DIR}/logs"
+      mkdir -p "$LOG_DIR"
       BASE_HTTP_PORT=8500
       PORT_STRIDE=10
 
@@ -37,12 +42,6 @@ engine:
         echo "Triton image does not exist: $TRITON_IMAGE" >&2
         exit 1
       fi
-
-      ROOT_REPO="/eagle/AmSC_Demos/amsc-d3/triton-models"
-      CUDA_REPO="${ROOT_REPO}/cuda_models"
-      WORK_DIR="/eagle/inference_service/amsc-d3-triton"
-      LOG_DIR="${WORK_DIR}/logs"
-      mkdir -p "$LOG_DIR"
 
       # These unused variables are parsed by the inference service
       # (qstat_inference_function) to map the running PBS job to a model:
