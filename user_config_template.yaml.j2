@@ -101,7 +101,7 @@ engine:
       start_model 6 nugraph2             "$ROOT_REPO" 6,7 "0, 1"
 
       # Polls until models are loaded or the process dies:
-	  python -c 'from client import TritonHEPClient; TritonHEPClient("localhost")'
+      python -c 'from triton_hep_client import TritonHEPClient; TritonHEPClient("localhost")'
 
       echo "Model loaded successfully"
       echo "All models started successfully."
