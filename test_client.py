@@ -22,10 +22,6 @@ import pytest
 from client import TritonHEPClient
 
 HOSTNAME = os.environ.get("TRITON_HOSTNAME", "localhost")
-_base_port_str = os.environ.get("TRITON_BASE_PORT", "8500")
-BASE_PORT: int | None = int(_base_port_str) if _base_port_str else None
-GRPC_PORT: int = int(os.environ.get("TRITON_GRPC_PORT", "8001"))
-
 
 def _require_model(client: TritonHEPClient, model_name: str) -> None:
     if model_name not in client.available_models:
@@ -35,9 +31,7 @@ def _require_model(client: TritonHEPClient, model_name: str) -> None:
 @pytest.fixture(scope="module")
 def client() -> TritonHEPClient:
     try:
-        if BASE_PORT is not None:
-            return TritonHEPClient(HOSTNAME, base_port=BASE_PORT, timeout=30)
-        return TritonHEPClient(HOSTNAME, grpc_port=GRPC_PORT, timeout=30)
+        return TritonHEPClient(HOSTNAME, timeout=60)
     except Exception as exc:
         pytest.skip(f"Triton server not available: {exc}")
 

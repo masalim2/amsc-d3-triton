@@ -10,14 +10,14 @@ import tritonclient.grpc as grpcclient
 
 log = logging.getLogger(__name__)
 
-GPU_MODEL_PORT_OFFSETS: dict[str, int] = {
-    "snbamsc_2dcnn_u": 0,
-    "snbamsc_2dcnn_v": 10,
-    "snbamsc_2dcnn_z": 20,
-    "DoubleMetricLearning": 30,
-    "higgsInteractionNet": 40,
-    "particlenet_AK4_PT": 50,
-    "nugraph2": 60,
+MODEL_PORTS: dict[str, int] = {
+    "snbamsc_2dcnn_u": 8501,
+    "snbamsc_2dcnn_v": 8511,
+    "snbamsc_2dcnn_z": 8521,
+    "DoubleMetricLearning": 8531,
+    "higgsInteractionNet": 8541,
+    "particlenet_AK4_PT": 8551,
+    "nugraph2": 8561,
 }
 
 TRITON_DTYPE_TO_NP = {
@@ -37,29 +37,9 @@ TRITON_DTYPE_TO_NP = {
 
 
 class TritonHEPClient:
-    """gRPC client for Triton-served HEP models.
+    """gRPC client for Triton-served HEP models."""
 
-    Two usage modes:
-
-    **Multi-model** (all GPU models on one node via
-    ``launch-all-gpu-models-node-pbs.sh``)::
-
-        client = TritonHEPClient("sophia-gpu-05.lab.alcf.anl.gov", base_port=8500)
-
-    **Single-model** (one Triton server via ``launch-tritonserver-pbs.sh``)::
-
-        client = TritonHEPClient("sophia-gpu-05.lab.alcf.anl.gov", grpc_port=8001)
-    """
-
-    def __init__(
-        self,
-        hostname: str,
-        *,
-        base_port: int | None = None,
-        grpc_port: int = 8001,
-        models: list[str] | None = None,
-        timeout: float = 120,
-    ):
+    def __init__(self, hostname: str, timeout: float = 120):
         if not logging.root.handlers:
             logging.basicConfig(
                 level=logging.INFO,
@@ -70,26 +50,11 @@ class TritonHEPClient:
         self._urls: dict[str, str] = {}
         self._metadata: dict[str, dict] = {}
 
-        if base_port is not None:
-            port_map = GPU_MODEL_PORT_OFFSETS
-            if models:
-                unknown = set(models) - set(port_map)
-                if unknown:
-                    raise ValueError(
-                        f"Unknown model(s): {unknown}. "
-                        f"Known GPU models: {list(port_map)}"
-                    )
-                port_map = {m: port_map[m] for m in models}
-            for model_name, offset in port_map.items():
-                url = f"{hostname}:{base_port + offset + 1}"
-                self._clients[model_name] = grpcclient.InferenceServerClient(url=url)
-                self._urls[model_name] = url
-                log.info("Registered client for %s at %s", model_name, url)
-        else:
-            url = f"{hostname}:{grpc_port}"
-            self._clients["_default"] = grpcclient.InferenceServerClient(url=url)
-            self._urls["_default"] = url
-            log.info("Registered single client at %s", url)
+        for model_name, port in MODEL_PORTS.items():
+            url = f"{hostname}:{port}"
+            self._clients[model_name] = grpcclient.InferenceServerClient(url=url)
+            self._urls[model_name] = url
+            log.info("Registered client for %s at %s", model_name, url)
 
         self._wait_for_ready(timeout)
         self._discover_metadata()
@@ -105,7 +70,7 @@ class TritonHEPClient:
                     if self._clients[name].is_server_ready():
                         log.info(
                             "Server ready: %s (%s)",
-                            name if name != "_default" else "single-model",
+                            name,
                             self._urls[name],
                         )
                         pending.discard(name)
@@ -127,27 +92,6 @@ class TritonHEPClient:
             time.sleep(min(2, max(0.1, remaining)))
 
     def _discover_metadata(self) -> None:
-        if "_default" in self._clients:
-            client = self._clients.pop("_default")
-            url = self._urls.pop("_default")
-            try:
-                index = client.get_model_repository_index()
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Cannot list models from {url}: {exc}"
-                ) from exc
-            for entry in index:
-                name = entry.name
-                state = getattr(entry, "state", "")
-                if state and state != "READY":
-                    log.debug("Skipping model %s (state=%s)", name, state)
-                    continue
-                self._clients[name] = client
-                self._urls[name] = url
-                log.info("Discovered model: %s", name)
-            if not self._clients:
-                raise RuntimeError(f"No READY models found on {url}")
-
         for model_name, client in self._clients.items():
             try:
                 meta = client.get_model_metadata(model_name)
@@ -236,6 +180,8 @@ class TritonHEPClient:
             data = data.astype(target_dtype)
 
         if max_batch > 0:
+            if meta_shape and meta_shape[0] == -1:
+                meta_shape = meta_shape[1:]
             ndim_no_batch = len(meta_shape)
             if data.ndim == ndim_no_batch:
                 data = data[np.newaxis, ...]
@@ -312,7 +258,9 @@ class TritonHEPClient:
     ) -> np.ndarray:
         result = self.infer(model_name, inputs)
         out = next(iter(result.values()))
-        return self._squeeze_batch(out)
+        if self._metadata[model_name]["max_batch_size"] > 0:
+            out = self._squeeze_batch(out)
+        return out
 
     def _infer_squeeze_all(
         self, model_name: str, inputs: dict[str, np.ndarray]
@@ -376,6 +324,8 @@ class TritonHEPClient:
         features = np.asarray(features, dtype=np.float32)
         if features.ndim == 1:
             features = features[np.newaxis, :]
+        elif features.ndim == 3 and features.shape[0] == 1:
+            features = features.squeeze(axis=0)
         return self._infer_single_output(
             "DoubleMetricLearning", {"FEATURES": features}
         )
