@@ -1,16 +1,14 @@
 [project]
 name = "triton-hep-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "gRPC inference client for Triton-served HEP models"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "tritonclient[grpc]",
+    "requests",
     "globus-compute-endpoint",
 ]
-
-[project.optional-dependencies]
-test = ["pytest"]
 
 [build-system]
 requires = ["setuptools>=64"]

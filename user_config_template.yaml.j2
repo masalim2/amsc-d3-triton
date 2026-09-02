@@ -100,8 +100,5 @@ engine:
       start_model 5 particlenet_AK4_PT   "$CUDA_REPO" 5   "0"
       start_model 6 nugraph2             "$ROOT_REPO" 6,7 "0, 1"
 
-      # Polls until models are loaded or the process dies:
-      python -c 'from triton_hep_client import TritonHEPClient; TritonHEPClient("localhost")'
-
       echo "Model loaded successfully"
       echo "All models started successfully."

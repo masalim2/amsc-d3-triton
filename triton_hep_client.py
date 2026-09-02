@@ -1,15 +1,24 @@
-"""gRPC inference client for Triton-served HEP models."""
+"""Globus Compute worker for the Triton gRPC relay, with readiness gating.
+
+Register ``triton_rpc`` with Globus Compute.  Everything the function needs is
+imported inside it (Globus Compute serializes the function body, not the
+module), except the module-level state below which persists for the life of a
+worker process and is re-created after a respawn.
+
+Contract:
+    triton_rpc(rpc: str, request_bytes: bytes, ready_timeout: float = 300.0) -> bytes
+    Raises RuntimeError("TRITON_GRPC_ERROR <StatusCode.name>: <details>") on a
+    Triton-side failure so the gateway can forward the status to the sidecar.
+"""
 
 from __future__ import annotations
 
-import logging
-import os
+import threading
 import time
 
-import numpy as np
-import tritonclient.grpc as grpcclient
-
-log = logging.getLogger(__name__)
+import grpc
+from tritonclient.grpc import service_pb2 as pb
+from tritonclient.grpc import service_pb2_grpc
 
 MODEL_PORTS: dict[str, int] = {
     "snbamsc_2dcnn_u": 8501,
@@ -20,252 +29,123 @@ MODEL_PORTS: dict[str, int] = {
     "particlenet_AK4_PT": 8551,
     "nugraph2": 8561,
 }
+DEFAULT_PORT = 8501  # target for server-level RPCs that name no model
 
-TRITON_DTYPE_TO_NP = {
-    "BOOL": np.bool_,
-    "UINT8": np.uint8,
-    "UINT16": np.uint16,
-    "UINT32": np.uint32,
-    "UINT64": np.uint64,
-    "INT8": np.int8,
-    "INT16": np.int16,
-    "INT32": np.int32,
-    "INT64": np.int64,
-    "FP16": np.float16,
-    "FP32": np.float32,
-    "FP64": np.float64,
+REQUEST_TYPES = {
+    "ServerLive": pb.ServerLiveRequest,
+    "ServerReady": pb.ServerReadyRequest,
+    "ServerMetadata": pb.ServerMetadataRequest,
+    "ModelReady": pb.ModelReadyRequest,
+    "ModelMetadata": pb.ModelMetadataRequest,
+    "ModelConfig": pb.ModelConfigRequest,
+    "ModelStatistics": pb.ModelStatisticsRequest,
+    "ModelInfer": pb.ModelInferRequest,
 }
 
+# RPCs that need the model loaded.  Probes (ServerLive/ServerReady/ModelReady)
+# are deliberately NOT gated: they must answer truthfully and immediately so a
+# client can poll them.
+GATED_RPCS = {"ModelInfer", "ModelMetadata", "ModelConfig", "ModelStatistics"}
 
-class TritonHEPClient:
-    """gRPC client for Triton-served HEP models."""
+# Errors that mean "not yet" rather than "no".  Add NOT_FOUND here only if you
+# run Triton in explicit/poll model-control mode, where the gRPC port can be up
+# before a model is registered; in the default mode Triton loads the repository
+# before it starts listening, so NOT_FOUND after the port is up is a real error.
+TRANSIENT = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
 
-    def __init__(self, hostname: str, timeout: float = 120):
-        if not logging.root.handlers:
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-            )
+# Process-lifetime state: one channel per port, and the set of models already
+# observed ready so steady-state calls skip the probe entirely.
+_lock = threading.Lock()
+_channels: dict[int, grpc.Channel] = {}
+_ready: set[tuple[int, str, str]] = set()
 
-        self._clients: dict[str, grpcclient.InferenceServerClient] = {}
-        self._urls: dict[str, str] = {}
-        self._metadata: dict[str, dict] = {}
 
-        for model_name, port in MODEL_PORTS.items():
-            url = f"{hostname}:{port}"
-            self._clients[model_name] = grpcclient.InferenceServerClient(url=url)
-            self._urls[model_name] = url
-            log.info("Registered client for %s at %s", model_name, url)
+def _channel(port: int) -> grpc.Channel:
+    with _lock:
+        ch = _channels.get(port)
+        if ch is None:
+            ch = _channels[port] = grpc.insecure_channel(f"localhost:{port}")
+        return ch
 
-        self._wait_for_ready(timeout)
-        self._discover_metadata()
 
-    # -- startup helpers --
+def _triton_error(code: grpc.StatusCode, details: str) -> RuntimeError:
+    return RuntimeError(f"TRITON_GRPC_ERROR {code.name}: {details}")
 
-    def _wait_for_ready(self, timeout: float) -> None:
-        deadline = time.monotonic() + timeout
-        pending = set(self._clients)
-        while pending:
-            for name in list(pending):
-                try:
-                    if self._clients[name].is_server_ready():
-                        log.info(
-                            "Server ready: %s (%s)",
-                            name,
-                            self._urls[name],
-                        )
-                        pending.discard(name)
-                except Exception:
-                    pass
-            if not pending:
-                break
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Servers not ready after {timeout}s. "
-                    f"Still waiting on: {pending}"
-                )
-            remaining = deadline - time.monotonic()
-            log.info(
-                "Waiting for %d server(s)... (%.0fs remaining)",
-                len(pending),
-                remaining,
-            )
-            time.sleep(min(2, max(0.1, remaining)))
 
-    def _discover_metadata(self) -> None:
-        for model_name, client in self._clients.items():
-            try:
-                meta = client.get_model_metadata(model_name)
-                config = client.get_model_config(model_name)
-                max_batch_size = config.config.max_batch_size
+def _wait_model_ready(port: int, name: str, version: str, timeout: float) -> None:
+    key = (port, name, version)
+    if key in _ready:
+        return
 
-                inputs = {}
-                for inp in meta.inputs:
-                    inputs[inp.name] = {
-                        "shape": list(inp.shape),
-                        "dtype": inp.datatype,
-                        "np_dtype": TRITON_DTYPE_TO_NP.get(inp.datatype, np.float32),
-                    }
+    deadline = time.monotonic() + timeout
+    channel = _channel(port)
 
-                outputs = {}
-                for out in meta.outputs:
-                    outputs[out.name] = {
-                        "shape": list(out.shape),
-                        "dtype": out.datatype,
-                        "np_dtype": TRITON_DTYPE_TO_NP.get(out.datatype, np.float32),
-                    }
-
-                self._metadata[model_name] = {
-                    "inputs": inputs,
-                    "outputs": outputs,
-                    "max_batch_size": max_batch_size,
-                }
-                log.info(
-                    "Model %s: max_batch_size=%d, inputs=%s, outputs=%s",
-                    model_name,
-                    max_batch_size,
-                    {n: (v["dtype"], v["shape"]) for n, v in inputs.items()},
-                    {n: (v["dtype"], v["shape"]) for n, v in outputs.items()},
-                )
-            except Exception as exc:
-                log.warning("Failed to get metadata for %s: %s", model_name, exc)
-
-    # -- public properties --
-
-    @property
-    def available_models(self) -> list[str]:
-        """Model names for which metadata was successfully discovered."""
-        return list(self._metadata)
-
-    def get_model_info(self, model_name: str) -> dict:
-        """Return discovered metadata for *model_name*.
-
-        The dict has keys ``"inputs"``, ``"outputs"`` (each mapping tensor name
-        to ``{"shape", "dtype", "np_dtype"}``), and ``"max_batch_size"``.
-        """
-        if model_name not in self._metadata:
-            raise ValueError(
-                f"Unknown model '{model_name}'. "
-                f"Available: {self.available_models}"
-            )
-        return self._metadata[model_name]
-
-    # -- generic inference --
-
-    def _get_client(self, model_name: str) -> grpcclient.InferenceServerClient:
-        if model_name not in self._clients:
-            raise ValueError(
-                f"No client for model '{model_name}'. "
-                f"Available: {list(self._clients)}"
-            )
-        return self._clients[model_name]
-
-    def _prepare_input(
-        self, model_name: str, tensor_name: str, data: np.ndarray
-    ) -> np.ndarray:
-        """Cast *data* to the correct dtype and add a batch dimension if needed."""
-        meta = self._metadata[model_name]
-        input_info = meta["inputs"].get(tensor_name)
-        if input_info is None:
-            raise ValueError(
-                f"Model '{model_name}' has no input '{tensor_name}'. "
-                f"Available inputs: {list(meta['inputs'])}"
-            )
-
-        target_dtype = input_info["np_dtype"]
-        meta_shape = input_info["shape"]
-        max_batch = meta["max_batch_size"]
-
-        data = np.asarray(data)
-        if data.dtype != target_dtype:
-            data = data.astype(target_dtype)
-
-        if max_batch > 0:
-            if meta_shape and meta_shape[0] == -1:
-                meta_shape = meta_shape[1:]
-            ndim_no_batch = len(meta_shape)
-            if data.ndim == ndim_no_batch:
-                data = data[np.newaxis, ...]
-            elif data.ndim == ndim_no_batch + 1:
-                pass
-            else:
-                raise ValueError(
-                    f"Input '{tensor_name}' for model '{model_name}': "
-                    f"expected {ndim_no_batch}D (unbatched) or "
-                    f"{ndim_no_batch + 1}D (batched), got {data.ndim}D "
-                    f"shape {data.shape}. Metadata shape (no batch): {meta_shape}"
-                )
-        else:
-            expected_ndim = len(meta_shape)
-            if data.ndim != expected_ndim:
-                raise ValueError(
-                    f"Input '{tensor_name}' for model '{model_name}': "
-                    f"expected {expected_ndim}D, got {data.ndim}D "
-                    f"shape {data.shape}. Metadata shape: {meta_shape}"
-                )
-
-        return data
-
-    def infer(
-        self,
-        model_name: str,
-        inputs: dict[str, np.ndarray],
-        outputs: list[str] | None = None,
-    ) -> dict[str, np.ndarray]:
-        """Send an inference request with numpy arrays.
-
-        Args:
-            model_name: Name of the Triton model.
-            inputs: ``{tensor_name: np.ndarray}`` for each model input.
-                Arrays are cast and batch-padded automatically using the
-                discovered model metadata.
-            outputs: Output tensor names to retrieve.  ``None`` retrieves all.
-
-        Returns:
-            ``{output_name: np.ndarray}`` for each requested output.
-        """
-        client = self._get_client(model_name)
-        meta = self.get_model_info(model_name)
-
-        triton_inputs = []
-        for name, data in inputs.items():
-            data = self._prepare_input(model_name, name, data)
-            triton_dtype = meta["inputs"][name]["dtype"]
-            inp = grpcclient.InferInput(name, list(data.shape), triton_dtype)
-            inp.set_data_from_numpy(data)
-            triton_inputs.append(inp)
-
-        output_names = list(meta["outputs"]) if outputs is None else outputs
-        triton_outputs = [
-            grpcclient.InferRequestedOutput(n) for n in output_names
-        ]
-
-        result = client.infer(
-            model_name=model_name,
-            inputs=triton_inputs,
-            outputs=triton_outputs,
+    # Phase 1: the Triton process may not be listening yet.
+    try:
+        grpc.channel_ready_future(channel).result(timeout=timeout)
+    except grpc.FutureTimeoutError:
+        raise _triton_error(
+            grpc.StatusCode.UNAVAILABLE,
+            f"nothing listening on localhost:{port} after {timeout:.0f}s",
         )
-        return {n: result.as_numpy(n) for n in output_names}
 
-    def infer_files(
-        self,
-        model_name: str,
-        input_path: str | os.PathLike,
-        output_path: str | os.PathLike,
-        outputs: list[str] | None = None,
-    ) -> None:
-        """Run inference reading/writing ``.npz`` files.
+    # Phase 2: the process is up but the model may still be loading.
+    stub = service_pb2_grpc.GRPCInferenceServiceStub(channel)
+    probe = pb.ModelReadyRequest(name=name, version=version)
+    last = "never probed"
+    while True:
+        try:
+            if stub.ModelReady(probe, timeout=5.0).ready:
+                with _lock:
+                    _ready.add(key)
+                return
+            last = "ready=false"
+        except grpc.RpcError as exc:
+            if exc.code() not in TRANSIENT:
+                raise _triton_error(exc.code(), exc.details())
+            last = exc.code().name
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _triton_error(
+                grpc.StatusCode.UNAVAILABLE,
+                f"model {name!r} on localhost:{port} not ready after "
+                f"{timeout:.0f}s (last probe: {last})",
+            )
+        time.sleep(min(1.0, remaining))
 
-        Args:
-            model_name: Name of the Triton model.
-            input_path: Path to a ``.npz`` file whose keys are input tensor
-                names.  A file-like object is also accepted.
-            output_path: Path where the output ``.npz`` will be written.
-                Keys are output tensor names.  A file-like object is also
-                accepted.
-            outputs: Output tensor names to retrieve.  ``None`` retrieves all.
-        """
-        with np.load(input_path) as data:
-            inputs = {name: data[name] for name in data.files}
-        result = self.infer(model_name, inputs, outputs=outputs)
-        np.savez(output_path, **result)
+
+def triton_rpc(data) -> bytes:
+    """Relay one unary Triton RPC to the local server that owns the model."""
+    try:
+        assert isinstance(data, dict)
+        rpc = data["rpc"]
+        request_bytes = data["request_bytes"]
+        ready_timeout = data.get("ready_timeout", 300.0)
+    except (KeyError, AssertionError):
+        raise _triton_error(grpc.StatusCode.INVALID_ARGUMENT, f"Bad GlobusCompute data payload: must receive dict with 'rpc' and 'request_bytes' keys.")
+
+    try:
+        req_cls = REQUEST_TYPES[rpc]
+    except KeyError:
+        raise _triton_error(grpc.StatusCode.UNIMPLEMENTED, f"rpc {rpc!r} is not relayed")
+    req = req_cls.FromString(request_bytes)
+
+    # ModelInferRequest uses model_name/model_version; the rest use name/version.
+    name = getattr(req, "model_name", None) or getattr(req, "name", None) or ""
+    version = getattr(req, "model_version", None) or getattr(req, "version", None) or ""
+    port = MODEL_PORTS.get(name, DEFAULT_PORT)
+
+    if rpc in GATED_RPCS:
+        if name and name not in MODEL_PORTS:
+            raise _triton_error(grpc.StatusCode.NOT_FOUND, f"unknown model {name!r}")
+        _wait_model_ready(port, name, version, ready_timeout)
+
+    stub = service_pb2_grpc.GRPCInferenceServiceStub(_channel(port))
+    try:
+        return getattr(stub, rpc)(req).SerializeToString()
+    except grpc.RpcError as exc:
+        if exc.code() is grpc.StatusCode.UNAVAILABLE:
+            # Triton went away under us; make the next call re-probe.
+            with _lock:
+                _ready.discard((port, name, version))
+        raise _triton_error(exc.code(), exc.details())
