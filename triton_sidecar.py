@@ -106,8 +106,8 @@ class Gateway:
         token: str,
         *,
         http_timeout: float = 30.0,
-        poll_interval: float = 1.0,
-        max_poll_interval: float = 5.0,
+        poll_interval: float = 0.2,
+        max_poll_interval: float = 2.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.http_timeout = http_timeout
@@ -195,13 +195,7 @@ class Gateway:
                     )
                 return resp.content
             if resp.status_code == 202:
-                retry_after = resp.headers.get("Retry-After")
                 sleep_for = interval
-                if retry_after:
-                    try:
-                        sleep_for = max(0.1, float(retry_after))
-                    except ValueError:
-                        pass
                 if deadline is not None:
                     sleep_for = min(sleep_for, max(0.0, deadline - time.monotonic()))
                 time.sleep(sleep_for)
@@ -374,7 +368,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--timeout", type=float, default=600.0,
         help="seconds to wait for a task when the client sets no deadline",
     )
-    p.add_argument("--poll-interval", type=float, default=1.0, help="initial result poll interval")
+    p.add_argument("--poll-interval", type=float, default=0.2, help="initial result poll interval")
     p.add_argument(
         "--max-payload", type=int, default=9_900_000,
         help="reject requests larger than this many serialized bytes "
