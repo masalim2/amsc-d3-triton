@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Local gRPC sidecar for the Globus-Compute-fronted Triton deployment.
+"""Local gRPC sidecar for the Triton models served by the FIRST gateway.
 
 Presents Triton's ``GRPCInferenceService`` on localhost so an unmodified
 Triton gRPC client (C++ or Python) can point at it as if it were the server.
-Each unary RPC is serialized to its protobuf bytes, POSTed to the REST
-gateway, executed on the remote endpoint, and the ``*Response`` bytes are
-returned to the caller.  ``ModelStreamInfer`` is supported by unrolling the
-stream into sequential unary relays.
+Each unary RPC is serialized to its protobuf bytes and POSTed to the gateway's
+generic tasks route, which routes on the Triton model's name, and the
+``*Response`` bytes are returned to the caller.  ``ModelStreamInfer`` is supported
+by unrolling the stream into sequential unary relays.
 
-Wire contract with the gateway (see triton_rpc_views.py):
+Wire contract (see triton_relay.py, which serves the far end):
 
-  POST {gateway}/rpc/{rpc}            body: serialized {rpc}Request
-      Content-Type: application/x-protobuf
+  POST {gateway}/tasks
       Authorization: Bearer <Globus access token>
-      -> 200 JSON {"task_id": "..."}   (any extra fields are ignored)
+      {"model": "{model_prefix}/{triton model}", "endpoint": "triton-rpc",
+       "rpc": "<rpc>", "request_bytes": "<base64 {rpc}Request>"}
+      -> 200 {"grpc_code": "OK", "response_bytes": "<base64 {rpc}Response>"}
+      -> 200 {"grpc_code": "<grpc.StatusCode name>", "details": "..."}
+      -> 4xx/5xx from the gateway, with Retry-After on 429 and cold-start 503
 
-  GET  {gateway}/rpc/result/{task_id}
-      -> 202                            task still pending
-      -> 200 application/x-protobuf     serialized {rpc}Response
-      -> 4xx/5xx JSON {"grpc_code": "<grpc.StatusCode name>", "details": "..."}
+RPCs that name no model (ServerLive, ServerReady, ServerMetadata) go to
+``--default-model``.
 
 Authentication is handled by ``alcf_ai``'s ``AutoGlobusAuth`` flow: every
 request derives a bearer token from the Globus refresh token stored under
@@ -36,6 +37,7 @@ Then in the user's code:  InferenceServerGrpcClient::Create(&client, "localhost:
 from __future__ import annotations
 
 import argparse
+import base64
 import logging
 import signal
 import sys
@@ -51,7 +53,7 @@ from tritonclient.grpc import service_pb2, service_pb2_grpc
 
 log = logging.getLogger("triton_sidecar")
 
-PROTOBUF_CONTENT_TYPES = {"application/x-protobuf", "application/octet-stream"}
+TASK_ENDPOINT = "triton-rpc"
 
 # RPC name -> response class.  Only read-only, unary RPCs are relayed.
 # Everything else (repository load/unload, shared-memory, trace/log settings)
@@ -68,7 +70,7 @@ UNARY_RPCS: dict[str, type] = {
 }
 
 # Responses that don't change while a model is loaded: cache them so the
-# client's metadata handshake doesn't cost a Globus Compute round trip each time.
+# client's metadata handshake doesn't cost a gateway round trip each time.
 CACHED_RPCS = {"ServerMetadata", "ModelMetadata", "ModelConfig"}
 
 HTTP_TO_GRPC: dict[int, grpc.StatusCode] = {
@@ -86,8 +88,8 @@ HTTP_TO_GRPC: dict[int, grpc.StatusCode] = {
     504: grpc.StatusCode.DEADLINE_EXCEEDED,
 }
 
-# Upstream hiccups worth retrying on the (idempotent) result GET.
-RETRYABLE_STATUS = frozenset({502, 503, 504})
+# The model is busy or starting: wait for it.
+RETRYABLE_STATUS = frozenset({429, 503})
 
 
 class RelayError(Exception):
@@ -153,31 +155,29 @@ class SidecarGlobusAuth(AutoGlobusAuth):
 
 
 class Gateway:
-    """Submit-then-poll client for the REST gateway."""
+    """Client for the gateway's generic tasks route."""
 
     def __init__(
         self,
         base_url: str,
         auth: httpx.Auth,
         *,
+        model_prefix: str,
+        default_model: str,
         http_timeout: float = 30.0,
-        poll_interval: float = 0.2,
-        max_poll_interval: float = 2.0,
-        max_transient_retries: int = 5,
+        max_retry_after: float = 30.0,
     ):
         self.base_url = base_url.rstrip("/")
-        self.poll_interval = poll_interval
-        self.max_poll_interval = max_poll_interval
-        self.max_transient_retries = max_transient_retries
+        self.model_prefix = model_prefix
+        self.default_model = default_model
+        self.http_timeout = http_timeout
+        self.max_retry_after = max_retry_after
 
         # Transport-level retries cover connections that were never
         # established, so they can't double-submit
         self.client = httpx.Client(
             auth=auth,
-            timeout=httpx.Timeout(http_timeout),
-            headers={"Accept": "application/x-protobuf, application/json"},
             transport=httpx.HTTPTransport(retries=3),
-            follow_redirects=True,  # requests did; APPEND_SLASH & friends
         )
 
     def close(self) -> None:
@@ -186,107 +186,72 @@ class Gateway:
     def call(
         self,
         rpc: str,
+        model: str,
         body: bytes,
         *,
-        budget: float | None,
+        budget: float,
         cancelled: Callable[[], bool],
     ) -> bytes:
         """Relay one unary RPC.  ``budget`` is seconds allowed end-to-end."""
-        deadline = None if budget is None else time.monotonic() + budget
-        task_id = self._submit(rpc, body)
-        return self._wait(task_id, deadline, cancelled)
-
-    def _submit(self, rpc: str, body: bytes) -> str:
-        try:
-            resp = self.client.post(
-                f"{self.base_url}/rpc/{rpc}",
-                content=body,
-                headers={"Content-Type": "application/x-protobuf"},
-            )
-        except httpx.HTTPError as exc:
-            raise RelayError(grpc.StatusCode.UNAVAILABLE, f"gateway unreachable: {exc}")
-
-        if resp.status_code != 200:
-            raise self._error_from_response(resp)
-        try:
-            task_id = resp.json()["task_id"]
-        except (ValueError, KeyError, TypeError):
-            raise RelayError(
-                grpc.StatusCode.INTERNAL,
-                f"gateway submit returned unexpected body: {resp.text[:200]!r}",
-            )
-        return str(task_id)
-
-    def _wait(
-        self, task_id: str, deadline: float | None, cancelled: Callable[[], bool]
-    ) -> bytes:
-        interval = self.poll_interval
-        transient = 0
-        url = f"{self.base_url}/rpc/result/{task_id}"
+        deadline = time.monotonic() + budget
+        payload = {
+            "model": f"{self.model_prefix}/{model or self.default_model}",
+            "endpoint": TASK_ENDPOINT,
+            "rpc": rpc,
+            "request_bytes": base64.b64encode(body).decode(),
+        }
         while True:
-            if cancelled():
-                raise RelayError(grpc.StatusCode.CANCELLED, "client cancelled")
-            if deadline is not None and time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                resp = self.client.post(
+                    f"{self.base_url}/tasks",
+                    json=payload,
+                    timeout=httpx.Timeout(self.http_timeout, read=max(remaining, 0.1)),
+                )
+            except httpx.TimeoutException:
                 raise RelayError(
                     grpc.StatusCode.DEADLINE_EXCEEDED,
-                    f"task {task_id} did not complete within the client deadline",
+                    f"{rpc} did not complete within the deadline",
                 )
-            try:
-                resp = self.client.get(url)
             except httpx.HTTPError as exc:
                 raise RelayError(grpc.StatusCode.UNAVAILABLE, f"gateway unreachable: {exc}")
 
             if resp.status_code == 200:
-                ctype = resp.headers.get("Content-Type", "").split(";")[0].strip()
-                if ctype not in PROTOBUF_CONTENT_TYPES:
-                    raise RelayError(
-                        grpc.StatusCode.INTERNAL,
-                        f"gateway result had Content-Type {ctype!r}, expected protobuf",
-                    )
-                return resp.content
-            if resp.status_code == 202:
-                # Deliberately ignoring Retry-After here: the gateway sends a
-                # flat 2s on every pending task, which would floor each RPC at
-                # 2s.  Our own backoff starts far tighter and converges on it.
-                self._sleep(interval, deadline)
-                interval = min(interval * 1.5, self.max_poll_interval)
-                continue
-            if resp.status_code in RETRYABLE_STATUS and transient < self.max_transient_retries:
-                transient += 1
-                log.warning(
-                    "gateway HTTP %d polling task %s (retry %d/%d)",
-                    resp.status_code, task_id, transient, self.max_transient_retries,
-                )
-                self._sleep(self._retry_after(resp, 0.5 * 2 ** transient), deadline)
-                continue
-            raise self._error_from_response(resp)
+                return self._parse_result(resp)
+            if resp.status_code not in RETRYABLE_STATUS:
+                raise self._error_from_response(resp)
+
+            wait = self._retry_after(resp)
+            if time.monotonic() + wait >= deadline:
+                raise self._error_from_response(resp)
+            log.info("gateway HTTP %d for %s; retrying in %.1fs", resp.status_code, rpc, wait)
+            time.sleep(wait)
+            if cancelled():
+                raise RelayError(grpc.StatusCode.CANCELLED, "client cancelled")
 
     @staticmethod
-    def _sleep(seconds: float, deadline: float | None) -> None:
-        if deadline is not None:
-            seconds = min(seconds, max(0.0, deadline - time.monotonic()))
-        time.sleep(seconds)
-
-    @staticmethod
-    def _retry_after(resp: httpx.Response, default: float) -> float:
-        """Honor a Retry-After sent with an error, clamped to something sane."""
-        raw = resp.headers.get("Retry-After")
-        if raw is None:
-            return default
+    def _parse_result(resp: httpx.Response) -> bytes:
         try:
-            return min(max(float(raw), 0.0), 30.0)
-        except ValueError:  # HTTP-date form; we don't need that precision
-            return default
+            result = resp.json()
+            code = grpc.StatusCode[result["grpc_code"]]
+            if code is grpc.StatusCode.OK:
+                return base64.b64decode(result["response_bytes"], validate=True)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RelayError(
+                grpc.StatusCode.INTERNAL,
+                f"gateway returned an unexpected body: {exc!r}",
+            )
+        raise RelayError(code, str(result.get("details", "")))
+
+    def _retry_after(self, resp: httpx.Response) -> float:
+        """Honor Retry-After, clamped to something sane."""
+        try:
+            return min(max(float(resp.headers["Retry-After"]), 0.0), self.max_retry_after)
+        except (KeyError, ValueError):  # missing, or HTTP-date form
+            return 1.0
 
     @staticmethod
     def _error_from_response(resp: httpx.Response) -> RelayError:
-        # Preferred: gateway forwards the Triton status as {"grpc_code", "details"}.
-        try:
-            payload = resp.json()
-            code = grpc.StatusCode[payload["grpc_code"]]
-            return RelayError(code, str(payload.get("details", "")))
-        except Exception:
-            pass
         code = HTTP_TO_GRPC.get(resp.status_code, grpc.StatusCode.UNKNOWN)
         return RelayError(code, f"gateway HTTP {resp.status_code}: {resp.text[:300]}")
 
@@ -356,7 +321,11 @@ class RelayServicer(service_pb2_grpc.GRPCInferenceServiceServicer):
         budget = self.default_timeout if remaining is None else min(remaining, self.default_timeout)
 
         t0 = time.monotonic()
-        raw = self.gateway.call(rpc, body, budget=budget, cancelled=lambda: not context.is_active())
+        # ModelInferRequest uses model_name; the model-scoped rest use name.
+        model = getattr(request, "model_name", None) or getattr(request, "name", "")
+        raw = self.gateway.call(
+            rpc, model, body, budget=budget, cancelled=lambda: not context.is_active()
+        )
         log.info(
             "%s ok: %d B in, %d B out, %.2fs",
             rpc, len(body), len(raw), time.monotonic() - t0,
@@ -435,19 +404,26 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
              "unless you intend to share your token with everyone on the host)",
     )
     p.add_argument(
-        "--gateway", default="https://inference-api.alcf.anl.gov/resource_server/sophia/triton/amsc-d3",
-        help="gateway base URL, e.g. https://inference-api.alcf.anl.gov/resource_server/sophia/triton/amsc-d3"
+        "--gateway", default="https://inference-api.alcf.anl.gov/federated/v1",
+        help="gateway base URL (default: %(default)s)",
+    )
+    p.add_argument(
+        "--model-prefix", default="amsc-d3",
+        help="catalog name of a Triton model is {prefix}/{name} (default: %(default)s)",
+    )
+    p.add_argument(
+        "--default-model", default="snbamsc_2dcnn_u",
+        help="Triton model that answers RPCs naming no model (default: %(default)s)",
     )
     p.add_argument("--max-workers", type=int, default=8, help="concurrent in-flight RPCs")
     p.add_argument(
         "--timeout", type=float, default=600.0,
         help="seconds to wait for a task when the client sets no deadline",
     )
-    p.add_argument("--poll-interval", type=float, default=0.2, help="initial result poll interval")
     p.add_argument(
-        "--max-payload", type=int, default=9_900_000,
+        "--max-payload", type=int, default=11_900_000,
         help="reject requests larger than this many serialized bytes "
-             "(Globus Compute caps task payloads at 10 MB)",
+             "(the gateway caps bodies at 16 MB, and base64 adds a third)",
     )
     p.add_argument("--cache-ttl", type=float, default=300.0, help="metadata/config cache TTL (0 disables)")
     p.add_argument(
@@ -465,8 +441,8 @@ def main(argv: list[str] | None = None) -> int:
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    # httpx logs a line per request; we already log one per RPC, and each RPC
-    # is a POST plus N polls.  Keep it for --log-level DEBUG only.
+    # httpx logs a line per request; we already log one per RPC.
+    # Keep it for --log-level DEBUG only.
     if level != "DEBUG":
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -482,7 +458,12 @@ def main(argv: list[str] | None = None) -> int:
         log.error("log in with `uvx alcf-ai auth login`, then try again")
         return 2
 
-    gateway = Gateway(args.gateway, auth, poll_interval=args.poll_interval)
+    gateway = Gateway(
+        args.gateway,
+        auth,
+        model_prefix=args.model_prefix,
+        default_model=args.default_model,
+    )
     servicer = RelayServicer(
         gateway,
         max_payload=args.max_payload,

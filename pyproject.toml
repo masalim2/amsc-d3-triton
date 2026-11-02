@@ -6,20 +6,24 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "tritonclient[grpc]",
-    "globus-compute-endpoint",
+    "fastapi",
+    "uvicorn",
 ]
 
 # The local sidecar only: alcf-ai brings the Globus auth flow (and needs
-# Python >= 3.12), which the compute-side endpoint install has no use for.
+# Python >= 3.12), which the compute-side relay install has no use for.
 [project.optional-dependencies]
 sidecar = [
     "httpx",
     "alcf-ai>=0.5.0",
 ]
 
+[project.scripts]
+triton-relay = "triton_relay:main"
+
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["triton_hep_client"]
+py-modules = ["triton_relay"]

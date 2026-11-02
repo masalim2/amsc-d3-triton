@@ -1,20 +1,18 @@
 ## Compute Environment Setup
 
-On the HPC compute cluster: 
+On the HPC compute cluster:
 
-- Run `uv pip install -e.` to install the Triton model client and dependencies.  This should be installed in the same venv as the Globus Compute Endpoint serving the Triton models.
-- `python register_globus_compute_func.py` -- registers the GC client function that invokes the local triton server.
-- `user_config_template.yaml.j2` -- Globus Compute Endpoint configuration for Sophia.  Starts the models in the background on the designated ports. This is copied into your actual GC endpoint.
+- Run `uv pip install -e.` to install the `triton-relay` entrypoint and its dependencies.
 
-Globus Compute invokes the `triton_rpc` function in `triton_hep_client.py`.  This takes the raw protobuf payload that was relayed from the inference gateway and sends it to the Triton server on a Sophia compute node. 
+Each Triton model is a FIRST deployment (see the `sophia/triton` LaunchTemplate in gateway-api-fixtures): one `tritonserver` plus one `triton-relay`.  The relay listens on the replica's Unix domain socket, forwards the unary gRPC calls arriving through the gateway's generic tasks route to the local Triton server, and reports the replica healthy once Triton has the model ready.  Triton itself listens only on a gRPC Unix socket in a private directory, with HTTP, metrics and the model load/unload API turned off, so the relay is its only way in, and the relay pins every request to its replica's model.
 
 ## Local gRPC Sidecar
 
 On the user side, wherever you are running the gRPC client application that connects to the Triton inference server: 
 
-- Run `uv pip install -e ".[sidecar]"` to install the dependencies.  (Globus Compute Endpoint is not necessary; the `sidecar` extra adds `alcf-ai`, which requires Python 3.12+.)
+- Run `uv pip install -e ".[sidecar]"` to install the dependencies.  (The `sidecar` extra adds `alcf-ai`, which requires Python 3.12+.)
 
-Run `triton_sidecar.py`: a local proxy gRPC server that forwards gRPC requests from to the upstream inference gateway.  
+Run `triton_sidecar.py`: a local proxy gRPC server that forwards gRPC requests to the upstream inference gateway.  A Triton model `nugraph2` is the catalog model `amsc-d3/nugraph2`.  
 
 ```bash
 uvx alcf-ai auth login   # once every 30 days
